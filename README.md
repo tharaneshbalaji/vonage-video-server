@@ -42,7 +42,7 @@ A professional video conferencing application built with **FastAPI** and **Strea
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/tharaneshbalaji/vonage-video-server.git
 cd vonage-video-server
 ```
 
@@ -279,23 +279,3 @@ The application includes comprehensive logging:
 2. Test the health endpoint (`/api/health`)
 3. Verify environment configuration
 4. Check Vonage Developer Dashboard for API status
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 🔗 Links
-
-- [Vonage Video API Documentation](https://developer.vonage.com/en/video/overview)
-- [FastAPI Documentation](https://fastapi.tiangolo.com/)
-- [Streamlit Documentation](https://docs.streamlit.io/)
-
----
