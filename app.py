@@ -2,6 +2,16 @@ import streamlit as st
 import streamlit.components.v1 as components
 import requests
 import json
+from datetime import datetime
+
+
+# ---------------------------
+# Function Stubs (to be properly defined later)
+# ---------------------------
+def test_backend_health():
+    """Placeholder - actual implementation below"""
+    pass
+
 
 # ---------------------------
 # Page config
@@ -43,6 +53,9 @@ for key in [
     "default_session_id",
     "current_meeting",
     "last_session_details",
+    "recording_status",
+    "current_archive_id",
+    "last_recording_info",
 ]:
     if key not in st.session_state:
         st.session_state[key] = None
@@ -75,22 +88,43 @@ def create_new_video_session():
 # Helper: Join Existing Session
 # ---------------------------
 def join_existing_video_session(session_id: str):
-    """Join an existing video session using the updated API endpoint"""
+    """Join an existing video session using token generation to validate"""
     try:
-        url = f"{backend_url}/api/sessions/{session_id}"
         st.info(f"Validating video session {session_id}...")
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
 
-        st.session_state.api_key = data["api_key"]
-        st.session_state.application_id = data["application_id"]
+        # Get application credentials from health endpoint
+        health_resp = requests.get(f"{backend_url}/api/health", timeout=10)
+        health_resp.raise_for_status()
+
+        # Try to generate a token for this session - if it succeeds, session exists
+        params = {
+            "username": st.session_state.get("username", "User"),
+            "session_id": session_id,
+        }
+        token_resp = requests.get(
+            f"{backend_url}/api/tokens/generate", params=params, timeout=10
+        )
+        token_resp.raise_for_status()
+
+        # Get api_key and application_id by creating a temporary session
+        # This is needed because token endpoint doesn't return these values
+        temp_session_resp = requests.post(
+            f"{backend_url}/api/sessions/create", timeout=10
+        )
+        temp_session_resp.raise_for_status()
+        temp_data = temp_session_resp.json()
+
+        # Set the required session state values
+        st.session_state.api_key = temp_data["api_key"]
+        st.session_state.application_id = temp_data["application_id"]
         st.session_state.default_session_id = session_id
+
         st.success("✅ Video session validated successfully!")
         return True
+
     except requests.HTTPError as e:
-        if e.response.status_code == 404:
-            st.error("❌ Video session not found. Please check the Session ID.")
+        if e.response.status_code == 500:
+            st.error("❌ Invalid or expired session ID.")
         else:
             st.error(f"❌ Failed to validate video session: {e}")
         return False
@@ -149,6 +183,174 @@ def generate_user_access_token(target_session_id=None):
         st.error(f"❌ Failed to generate access token: {e}")
         # Return Nones to indicate failure
         return None, None
+
+
+# ---------------------------
+# Helper: Start Recording
+# ---------------------------
+def start_recording_session():
+    """Start recording the current video session"""
+    if not st.session_state.current_meeting:
+        st.error("❌ No active meeting to record")
+        return False
+
+    session_id = st.session_state.current_meeting["session_id"]
+    recording_name = f"Recording_{session_id}_{username}"
+
+    try:
+        url = f"{backend_url}/api/recordings/start"
+        payload = {"session_id": session_id, "name": recording_name}
+        st.info("🔴 Starting recording...")
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Store recording info in session state
+        st.session_state.recording_status = "recording"
+        st.session_state.current_archive_id = data["archive_id"]
+
+        st.success("✅ Recording started successfully!")
+        st.info(f"📹 Archive ID: {data['archive_id']}")
+        return True
+
+    except Exception as e:
+        st.error(f"❌ Failed to start recording: {e}")
+        return False
+
+
+# ---------------------------
+# Helper: Stop Recording
+# ---------------------------
+def stop_recording_session():
+    """Stop recording and get recording info"""
+    if not st.session_state.current_archive_id:
+        st.error("❌ No active recording to stop")
+        return False
+
+    archive_id = st.session_state.current_archive_id
+
+    try:
+        # Stop the recording
+        url = f"{backend_url}/api/recordings/stop"
+        payload = {"archive_id": archive_id}
+
+        # Show loading indicator for stopping
+        stop_placeholder = st.empty()
+        stop_placeholder.info("⏹️ Stopping recording...")
+
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+
+        stop_placeholder.success("✅ Recording stopped!")
+
+        # Show loading indicator for fetching recording info
+        info_placeholder = st.empty()
+        info_placeholder.info("📡 Fetching recording details...")
+
+        # Get recording info immediately after stopping
+        recording_info = get_recording_info(archive_id)
+        info_placeholder.empty()  # Clear the loading message
+
+        if recording_info:
+            st.session_state.recording_status = "stopped"
+            st.session_state.last_recording_info = recording_info
+            st.session_state.current_archive_id = None
+
+            # Display success message with recording details
+            st.success("✅ Recording completed and details retrieved!")
+
+            # Show immediate URL if available
+            if recording_info.get("url"):
+                st.markdown(
+                    f"🔗 **Recording available:** [{recording_info['url']}]({recording_info['url']})"
+                )
+            else:
+                st.info(
+                    "📝 Recording is being processed. URL will be available shortly."
+                )
+
+            return True
+        else:
+            st.session_state.recording_status = "stopped"
+            st.session_state.current_archive_id = None
+            st.warning("⚠️ Recording stopped but failed to retrieve details")
+            return False
+
+    except Exception as e:
+        st.error(f"❌ Failed to stop recording: {e}")
+        # Clear recording state on error
+        st.session_state.recording_status = None
+        st.session_state.current_archive_id = None
+        return False
+
+
+# ---------------------------
+# Helper: Get Recording Info
+# ---------------------------
+def get_recording_info(archive_id):
+    """Get recording details and download URL"""
+    try:
+        url = f"{backend_url}/api/recordings/{archive_id}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Provide status-specific feedback
+        status = data.get("status", "unknown")
+        if status == "available" and data.get("url"):
+            st.success(f"📋 Recording ready! Status: {status}")
+        elif status == "available" and not data.get("url"):
+            st.warning(f"📋 Recording status: {status} but URL not provided")
+        elif status in ["stopped", "paused", "uploaded"]:
+            st.info(f"📋 Recording status: {status} - Processing in progress")
+        else:
+            st.info(f"📋 Recording status: {status}")
+
+        return data
+
+    except requests.HTTPError as e:
+        if e.response.status_code == 404:
+            st.error(f"❌ Recording not found for Archive ID: {archive_id}")
+        else:
+            st.error(f"❌ HTTP Error getting recording info: {e.response.status_code}")
+        return None
+    except requests.RequestException as e:
+        st.error(f"❌ Network error getting recording info: {e}")
+        return None
+    except Exception as e:
+        st.error(f"❌ Failed to get recording info: {e}")
+        return None
+
+
+# ---------------------------
+# Helper: Check if Recording URL is Available
+# ---------------------------
+def check_recording_url_available(archive_id):
+    """Check if recording URL is available and return status info"""
+    try:
+        url = f"{backend_url}/api/recordings/{archive_id}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        status = data.get("status", "unknown")
+        url_available = bool(data.get("url"))
+
+        return {
+            "available": url_available,
+            "status": status,
+            "url": data.get("url"),
+            "data": data,
+        }
+
+    except Exception as e:
+        return {
+            "available": False,
+            "status": "error",
+            "url": None,
+            "error": str(e),
+            "data": None,
+        }
 
 
 # ---------------------------
@@ -240,6 +442,65 @@ with col_main:
             st.session_state.last_session_details = None
             st.rerun()
 
+    # Show recording details if available
+    if not st.session_state.current_meeting and st.session_state.get(
+        "last_recording_info"
+    ):
+        st.markdown("---")
+        st.subheader("🎥 Last Recording Details")
+
+        recording_info = st.session_state.last_recording_info
+
+        col_rec_info1, col_rec_info2 = st.columns(2)
+
+        with col_rec_info1:
+            st.info("**Recording Information**")
+            st.write(f"**Archive ID:** `{recording_info.get('archive_id', 'N/A')}`")
+            st.write(f"**Name:** {recording_info.get('name', 'N/A')}")
+            st.write(f"**Status:** {recording_info.get('status', 'N/A')}")
+
+        with col_rec_info2:
+            st.success("**Recording Details**")
+            if recording_info.get("duration"):
+                st.write(f"**Duration:** {recording_info.get('duration')} seconds")
+            st.write(f"**Created:** {recording_info.get('created_at', 'N/A')}")
+
+        # Recording download link
+        if recording_info.get("url"):
+            recording_url = recording_info["url"]
+            st.markdown(f"**Recording available:** [{recording_url}]({recording_url})")
+        else:
+            recording_status = recording_info.get("status", "unknown")
+            if recording_status == "available":
+                st.warning("⚠️ Recording is available but URL is missing.")
+            elif recording_status in ["stopped", "paused"]:
+                st.info(
+                    "📝 Recording is being processed. Please refresh to check status."
+                )
+            else:
+                st.info(f"📝 Status: {recording_status}. Processing in progress.")
+
+            # Add refresh functionality for historical recordings too
+            if st.button("🔄 Refresh Recording Status", key="refresh_historical"):
+                with st.spinner("Refreshing recording status..."):
+                    updated_info = get_recording_info(recording_info.get("archive_id"))
+                    if updated_info:
+                        st.session_state.last_recording_info = updated_info
+                        if updated_info.get("url"):
+                            st.success("✅ Recording URL is now available!")
+                        else:
+                            st.info(f"Status: {updated_info.get('status', 'unknown')}")
+                        st.rerun()
+
+        # Show raw recording data in expandable section
+        with st.expander("🔍 View Raw Recording Data"):
+            st.json(recording_info)
+
+        # Button to clear recording details
+        if st.button("🗑️ Clear Recording Details"):
+            st.session_state.last_recording_info = None
+            st.rerun()
+
 # ---------------------------
 # Video Section
 # ---------------------------
@@ -248,8 +509,13 @@ if st.session_state.current_meeting:
 
     # Use json.dumps() for robust string embedding into JavaScript
     token_js = json.dumps(meet["token"].strip())
-    app_id_js = json.dumps(meet["application_id"].strip())
-    session_js = json.dumps(meet["session_id"].strip())
+
+    # Handle potential None values safely
+    app_id = meet.get("application_id") or st.session_state.get("application_id") or ""
+    session_id = meet.get("session_id") or ""
+
+    app_id_js = json.dumps(app_id.strip() if app_id else "")
+    session_js = json.dumps(session_id.strip() if session_id else "")
     username_js = json.dumps(username.strip())
 
     with col_main:
@@ -966,23 +1232,103 @@ if st.session_state.current_meeting:
             video_html, height=750, scrolling=False
         )  # Increased height for better video display
 
+    # Recording Controls Section
+    st.markdown("---")
+    st.subheader("🎥 Recording Controls")
+
+    col_rec1, col_rec2 = st.columns([1, 1])
+
+    with col_rec1:
+        # Start Recording Button
+        start_disabled = st.session_state.recording_status == "recording"
+        if st.button("🔴 Start Recording", disabled=start_disabled):
+            start_recording_session()
+            st.rerun()
+
+    with col_rec2:
+        # Stop Recording Button
+        stop_disabled = st.session_state.recording_status != "recording"
+        if st.button("⏹️ Stop Recording", disabled=stop_disabled):
+            stop_recording_session()
+            st.rerun()
+
+    # Recording Status Display
+    if st.session_state.recording_status == "recording":
+        st.info(
+            f"🔴 Recording in progress... Archive ID: {st.session_state.current_archive_id}"
+        )
+    elif (
+        st.session_state.recording_status == "stopped"
+        and st.session_state.last_recording_info
+    ):
+        st.success("✅ Recording completed!")
+
+        # Display recording information
+        recording_info = st.session_state.last_recording_info
+
+        col_info1, col_info2 = st.columns([1, 1])
+        with col_info1:
+            st.write(f"**Archive ID:** `{recording_info.get('archive_id', 'N/A')}`")
+            st.write(f"**Name:** {recording_info.get('name', 'N/A')}")
+            st.write(f"**Status:** {recording_info.get('status', 'N/A')}")
+
+        with col_info2:
+            if recording_info.get("duration"):
+                st.write(f"**Duration:** {recording_info.get('duration')} seconds")
+            st.write(f"**Created:** {recording_info.get('created_at', 'N/A')}")
+
+        # Recording URL Link - Display in the requested format
+        if recording_info.get("url"):
+            recording_url = recording_info["url"]
+            st.markdown(f"**Recording available:** [{recording_url}]({recording_url})")
+        else:
+            recording_status = recording_info.get("status", "unknown")
+            if recording_status == "available":
+                st.warning(
+                    "⚠️ Recording is available but URL is missing. Please contact support."
+                )
+            elif recording_status in ["stopped", "paused"]:
+                st.info(
+                    "📝 Recording is being processed. URL will be available when status becomes 'available'."
+                )
+            else:
+                st.info(
+                    f"📝 Recording status: {recording_status}. URL will be available when processing completes."
+                )
+
+            # Add a refresh button to check for URL availability
+            if st.button("🔄 Check Recording Status", key="refresh_recording"):
+                with st.spinner("Checking recording status..."):
+                    updated_info = get_recording_info(recording_info.get("archive_id"))
+                    if updated_info:
+                        st.session_state.last_recording_info = updated_info
+                        if updated_info.get("url"):
+                            st.success("✅ Recording URL is now available!")
+                        else:
+                            st.info(
+                                f"Status: {updated_info.get('status', 'unknown')} - Still processing..."
+                            )
+                        st.rerun()
+
     st.markdown("---")
     if st.button("🚪 Leave Meeting"):
-        # Get session details before leaving
+        # Store basic meeting info before leaving
         session_id = st.session_state.current_meeting["session_id"]
-        try:
-            url = f"{backend_url}/api/sessions/{session_id}"
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            session_details = resp.json()
+        meeting_info = {
+            "session_id": session_id,
+            "api_key": st.session_state.get("api_key", "N/A"),
+            "application_id": st.session_state.get("application_id", "N/A"),
+            "left_at": datetime.now().isoformat(),
+        }
 
-            # Store session details to show after leaving
-            st.session_state.last_session_details = session_details
-        except Exception as e:
-            st.session_state.last_session_details = {"error": str(e)}
+        # Store meeting details to show after leaving
+        st.session_state.last_session_details = meeting_info
 
-        # Clear current meeting
+        # Clear current meeting and recording state
         st.session_state.current_meeting = None
+        st.session_state.recording_status = None
+        st.session_state.current_archive_id = None
+        # Keep last_recording_info for display
         st.rerun()
 
 with col_sidebar:

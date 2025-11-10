@@ -12,11 +12,19 @@ from datetime import datetime
 from typing import Dict, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from vonage import Auth, HttpClientOptions, Vonage
-from vonage_video import SessionOptions, TokenOptions
+from vonage_jwt.verify_jwt import verify_signature
+from vonage_video import CreateArchiveRequest, SessionOptions, TokenOptions
+
+from schema import (
+    ApplicationHealthResponse,
+    StartRecordingRequest,
+    StopRecordingRequest,
+    UserTokenResponse,
+    VideoSessionResponse,
+)
 
 
 # ---------------------------
@@ -48,6 +56,7 @@ def load_vonage_environment_config() -> Dict[str, str]:
         "VONAGE_API_SECRET": os.getenv("VONAGE_API_SECRET"),
         "VONAGE_APPLICATION_ID": os.getenv("VONAGE_APPLICATION_ID"),
         "VONAGE_PRIVATE_KEY_PATH": os.getenv("VONAGE_PRIVATE_KEY_PATH"),
+        "VONAGE_SIGNATURE_SECRET": os.getenv("VONAGE_SIGNATURE_SECRET"),
     }
 
     missing_vars = [key for key, value in required_env_vars.items() if not value]
@@ -64,6 +73,7 @@ VONAGE_API_KEY = vonage_config["VONAGE_API_KEY"]
 VONAGE_API_SECRET = vonage_config["VONAGE_API_SECRET"]
 VONAGE_APPLICATION_ID = vonage_config["VONAGE_APPLICATION_ID"]
 VONAGE_PRIVATE_KEY_PATH = vonage_config["VONAGE_PRIVATE_KEY_PATH"]
+SIGNATURE_SECRET = vonage_config["VONAGE_SIGNATURE_SECRET"]
 
 
 # ---------------------------
@@ -113,44 +123,6 @@ DEFAULT_SESSION_ID = create_default_video_session(vonage_video_client)
 
 
 # ---------------------------
-# API Response Models
-# ---------------------------
-class VideoSessionResponse(BaseModel):
-    """Response model for video session operations."""
-
-    session_id: str
-    api_key: str
-    application_id: str
-    created_at: Optional[str] = None
-
-
-
-class UserTokenResponse(BaseModel):
-    """Response model for user token generation."""
-
-    token: str
-    username: str
-    session_id: str
-    role: str = "publisher"
-
-
-class ApplicationHealthResponse(BaseModel):
-    """Response model for application health check."""
-
-    status: str
-    timestamp: str
-    environment_info: Dict[str, Optional[str]]
-    uptime: str = "unknown"
-
-
-class CreateSessionRequest(BaseModel):
-    """Request model for creating a new video session."""
-
-    media_mode: str = "routed"
-
-
-
-# ---------------------------
 # FastAPI Application Setup
 # ---------------------------
 def create_video_api_application() -> FastAPI:
@@ -179,21 +151,51 @@ def create_video_api_application() -> FastAPI:
 video_api_app = create_video_api_application()
 
 
+# ---------------------------
+# Health Check Endpoints
+# ---------------------------
+@video_api_app.get("/api/health", response_model=ApplicationHealthResponse)
+async def get_application_health_status():
+    """Get application health status and environment information."""
+    try:
+        current_timestamp = datetime.now().isoformat()
+        environment_info = {
+            "api_key_configured": "Yes" if VONAGE_API_KEY else "No",
+            "application_id_configured": "Yes" if VONAGE_APPLICATION_ID else "No",
+            "private_key_exists": str(os.path.exists(VONAGE_PRIVATE_KEY_PATH)),
+            "default_session_available": "Yes" if DEFAULT_SESSION_ID else "No",
+            "vonage_client_status": "Initialized" if vonage_video_client else "Failed",
+        }
+        app_logger.info("Health check requested")
+        return ApplicationHealthResponse(
+            status="healthy",
+            timestamp=current_timestamp,
+            environment_info=environment_info,
+            uptime="available",
+        )
+    except Exception as e:
+        app_logger.error("Health check failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Health check failed",
+        ) from e
+
+
+# ---------------------------
+# Session Management Endpoints
+# ---------------------------
 @video_api_app.post("/api/sessions/create", response_model=VideoSessionResponse)
 async def create_new_video_session():
     """Create a new video session and return session details."""
     try:
         new_session_id = create_default_video_session(vonage_video_client)
-
         app_logger.info("New video session created: %s", new_session_id)
-
         return VideoSessionResponse(
             session_id=new_session_id,
             api_key=VONAGE_API_KEY,
             application_id=VONAGE_APPLICATION_ID,
             created_at=datetime.now().isoformat(),
         )
-
     except Exception as e:
         app_logger.exception("Failed to create new video session")
         raise HTTPException(
@@ -202,30 +204,9 @@ async def create_new_video_session():
         ) from e
 
 
-@video_api_app.get("/api/sessions/{session_id}", response_model=VideoSessionResponse)
-async def get_video_session_info(session_id: str):
-    """Retrieve video session information by session ID."""
-    try:
-        # Validate session exists by attempting to generate a test token
-        validation_token_options = TokenOptions(session_id=session_id, role="publisher")
-        vonage_video_client.video.generate_client_token(validation_token_options)
-
-        app_logger.info("Video session validated: %s", session_id)
-
-        return VideoSessionResponse(
-            session_id=session_id,
-            api_key=VONAGE_API_KEY,
-            application_id=VONAGE_APPLICATION_ID,
-        )
-
-    except Exception as e:
-        app_logger.warning("Invalid session ID requested: %s", session_id)
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Video session not found or invalid",
-        ) from e
-
-
+# ---------------------------
+# Token Generation Endpoints
+# ---------------------------
 @video_api_app.get("/api/tokens/generate", response_model=UserTokenResponse)
 async def generate_user_access_token(
     username: str = "User", session_id: Optional[str] = None, role: str = "publisher"
@@ -241,10 +222,14 @@ async def generate_user_access_token(
         )
 
     try:
-        user_token_options = TokenOptions(
-            session_id=target_session_id, role=role, data=f"username={username}"
-        )
+        import urllib.parse # TODO: Use the json dump method instead of urlencoding
 
+        data = {"username": username, "session_id": target_session_id, "role": role}
+        data = urllib.parse.urlencode(data)
+
+        user_token_options = TokenOptions(
+            session_id=target_session_id, role=role, connection_data=data
+        )
         access_token = vonage_video_client.video.generate_client_token(
             user_token_options
         )
@@ -253,7 +238,7 @@ async def generate_user_access_token(
             access_token = access_token.decode("utf-8")
 
         app_logger.info("Access token generated for user: %s", username)
-
+        app_logger.info("Token for session: %s", target_session_id)
         return UserTokenResponse(
             token=access_token,
             username=username,
@@ -269,35 +254,123 @@ async def generate_user_access_token(
         ) from e
 
 
-@video_api_app.get("/api/health", response_model=ApplicationHealthResponse)
-async def get_application_health_status():
-    """Get application health status and environment information."""
+# ---------------------------
+# Webhook Endpoints
+# ---------------------------
+@video_api_app.post("/api/video/webhook")
+async def vonage_video_webhook(request: Request):
+    """Handle Vonage Video Webhook Events."""
     try:
-        current_timestamp = datetime.now().isoformat()
-
-        environment_info = {
-            "api_key_configured": "Yes" if VONAGE_API_KEY else "No",
-            "application_id_configured": "Yes" if VONAGE_APPLICATION_ID else "No",
-            "private_key_exists": str(os.path.exists(VONAGE_PRIVATE_KEY_PATH)),
-            "default_session_available": "Yes" if DEFAULT_SESSION_ID else "No",
-            "vonage_client_status": "Initialized" if vonage_video_client else "Failed",
-        }
-
-        app_logger.info("Health check requested")
-
-        return ApplicationHealthResponse(
-            status="healthy",
-            timestamp=current_timestamp,
-            environment_info=environment_info,
-            uptime="available",
+        auth_header = request.headers["authorization"].split()
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authorization header",
         )
 
+    token = auth_header[1].strip()
+    app_logger.info("Verifying webhook token: %s", token)
+
+    if verify_signature(token, SIGNATURE_SECRET) is False:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
+        )
+
+    try:
+        event = await request.json()
+    except Exception:
+        event = {}
+        app_logger.warning("Request body is empty or not valid JSON")
+
+    app_logger.info("Received Vonage Video Webhook Event: %s", event)
+    return {"status": "ok", "event": event}
+
+
+# ---------------------------
+# Recording (Archiving) Endpoints
+# ---------------------------
+@video_api_app.post("/api/recordings/start")
+async def start_recording(request: StartRecordingRequest):
+    """Start recording (archiving) a Vonage video session."""
+    try:
+        archive_request = CreateArchiveRequest(
+            session_id=request.session_id,
+            name=request.name,
+            has_audio=True,
+            has_video=True,
+            output_mode="composed",
+            resolution="1920x1080",
+        )
+
+        archive = vonage_video_client.video.start_archive(archive_request)
+        app_logger.info(
+            "Recording started: session=%s, archive_id=%s",
+            request.session_id,
+            archive.id,
+        )
+        return {
+            "status": "started",
+            "archive_id": archive.id,
+            "session_id": request.session_id,
+            "name": archive.name,
+            "created_at": archive.created_at,
+        }
     except Exception as e:
-        app_logger.error("Health check failed: %s", e)
+        app_logger.exception("Failed to start recording")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Health check failed",
-        ) from e
+            detail=f"Recording failed: {str(e)}",
+        )
+
+
+@video_api_app.post("/api/recordings/stop")
+async def stop_recording(request: StopRecordingRequest):
+    """Stop an ongoing recording."""
+    try:
+        archive = vonage_video_client.video.stop_archive(request.archive_id)
+        app_logger.info("Recording stopped: archive_id=%s", request.archive_id)
+        return {"status": "stopped", "archive_id": archive.id}
+    except Exception as e:
+        app_logger.exception("Failed to stop recording")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Stop failed: {str(e)}",
+        )
+
+
+@video_api_app.get("/api/recordings/{archive_id}")
+async def get_recording_info(archive_id: str):
+    """Retrieve recording details and download URL."""
+    try:
+        archive = vonage_video_client.video.get_archive(archive_id)
+        return {
+            "archive_id": archive.id,
+            "status": archive.status,
+            "url": archive.url,
+            "duration": archive.duration,
+            "name": archive.name,
+            "created_at": archive.created_at,
+        }
+    except Exception as e:
+        app_logger.exception("Failed to fetch recording info")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Get recording failed: {str(e)}",
+        )
+
+
+@video_api_app.get("/api/recordings/stream/{stream_id}")
+async def get_stream_info(stream_id: str):
+    """Retrieve stream information for a specific recording."""
+    try:
+        stream = vonage_video_client.video.get_stream(stream_id)
+        return stream
+    except Exception as e:
+        app_logger.exception("Failed to fetch stream info")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Get stream failed: {str(e)}",
+        )
 
 
 # ---------------------------
@@ -310,7 +383,9 @@ def run_video_api_server():
     server_host = os.getenv("SERVER_HOST", "127.0.0.1")
     server_port = int(os.getenv("SERVER_PORT", "5000"))
 
-    app_logger.info(f"Starting Vonage Video API server on {server_host}:{server_port}")
+    app_logger.info(
+        "Starting Vonage Video API server on %s:%d", server_host, server_port
+    )
 
     uvicorn.run(
         video_api_app,
